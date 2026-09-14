@@ -61,9 +61,10 @@ happening at install time.
   Assistant's NUT integration, with no monitor/control privileges — see
   [Home Assistant integration](#home-assistant-integration) below.
 - Installs a shutdown helper (`scripts/pve-guest-shutdown.sh`) that, on a
-  critical battery event, gracefully shuts down all running VMs and LXC
-  containers (with a bounded grace period, then a forced stop) before
-  powering off the host.
+  critical battery event, stops all running VMs and LXC containers with an
+  explicit, bounded timeout before powering off the host — see [Why the
+  shutdown helper exists](#why-the-shutdown-helper-exists) below for why
+  this isn't just Proxmox's own default shutdown behavior.
 - Backs up any existing NUT config files it touches before overwriting them,
   so it's safe to re-run.
 
@@ -95,7 +96,7 @@ Options:
 | `--ha-password PASS` | Password for the Home Assistant account (skips the prompt, implies `--ha-user`) | prompted interactively |
 | `--generate-password` | Generate random passwords instead of prompting | off |
 | `--listen-lan` | Also listen on all interfaces, not just localhost (implied by `--ha-user`) | off |
-| `--no-guest-shutdown` | Skip installing the VM/LXC graceful-shutdown helper | off |
+| `--no-guest-shutdown` | Skip the timeout helper (Proxmox's own default guest-stop still applies) | off |
 | `--uninstall` | Stop services and remove the installed shutdown helper | — |
 | `-y`, `--yes` | Don't prompt for confirmation | off |
 | `-h`, `--help` | Show help | — |
@@ -128,6 +129,36 @@ port 3493, do it with a firewall rule (e.g. the Proxmox/Datacenter
 firewall) scoped to the Home Assistant VM's IP — `upsd` itself no longer
 does per-host access control.
 
+## Why the shutdown helper exists
+
+Proxmox VE already stops every running VM/LXC on **any** host shutdown, with
+no extra configuration: `pve-guests.service` is enabled by default on every
+install, and its stop action (`pvesh ... stopall`) runs as part of the
+normal systemd shutdown sequence — triggered by the GUI, `shutdown -h now`,
+and therefore by NUT's default `SHUTDOWNCMD` too. If all you wanted was "try
+to shut guests down cleanly before the host goes off," you don't need this
+script's helper at all; `--no-guest-shutdown` gets you a plain
+`shutdown -h +0`, and Proxmox's own mechanism still runs.
+
+What the helper actually adds is a **bounded, explicit timeout**. Left to
+its own defaults, `stopall`'s per-guest timeout and force-stop behavior
+depend on your installed Proxmox version — and there's a documented history
+of that default being effectively unbounded on some versions. That's fine
+for a normal reboot, but not for a UPS with a couple of minutes of runtime
+left: an unresponsive guest could leave the host still waiting to shut down
+when the battery actually dies, which is worse than not having a shutdown
+trigger at all. The helper just calls Proxmox's own `stopall` task with an
+explicit `--timeout`/`--force-stop`, rather than trusting whatever your PVE
+version defaults to.
+
+One thing I haven't been able to verify (Proxmox's own docs and forum were
+unreachable from the environment this was built in): whether `stopall`
+stops guests in parallel or one at a time when you haven't configured an
+explicit "Start/Shutdown order" on them (the common case). If it's
+sequential, the worst-case total time scales with your guest count — with
+close to a dozen VMs/LXCs, that's worth testing for yourself (see below)
+rather than assuming.
+
 ## Verifying the install
 
 ```sh
@@ -145,9 +176,17 @@ journalctl -u nut-server -u 'nut-driver@eaton3s' -n 50
 
 Pull the UPS's power cord and let the battery drain to a critical level (or
 temporarily lower `upsmon.conf`'s thresholds via `upssched`/`ups.conf` for a
-faster test in a maintenance window). You can also dry-run the guest
-shutdown logic without actually stopping anything:
+faster test in a maintenance window). You can also preview what the helper
+would do without actually stopping anything or powering off:
 
 ```sh
 /usr/local/bin/pve-guest-shutdown.sh --dry-run
 ```
+
+This lists your currently-running guests and logs the exact `pvesh`/`shutdown`
+commands it would run, without executing them. It won't tell you how long a
+*real* run would take with all your guests stopping at once, though — for
+that, with everything backed up and in a maintenance window, it's worth
+timing a real (non-dry-run) invocation once, so `GUEST_TIMEOUT` in the
+script (default 60s) is a number you've actually validated against your own
+guest count, not just trusted.

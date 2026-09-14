@@ -4,8 +4,10 @@
 #
 # Installs and configures Network UPS Tools (NUT) on a Proxmox VE node for a
 # USB-connected Eaton 3S UPS, in standalone mode. Also installs a shutdown
-# helper that gracefully stops running VMs/LXCs before the host powers off
-# on a critical battery event.
+# helper that, on a critical battery event, tells Proxmox to stop all
+# running VMs/LXCs with a timeout suited to a dying UPS (rather than
+# whatever your PVE version's own default happens to be) before the host
+# powers off.
 #
 # Run with --help (or see usage() below) for the full option list.
 
@@ -47,8 +49,11 @@ install-nut-eaton.sh
 
 Installs and configures Network UPS Tools (NUT) on a Proxmox VE node for a
 USB-connected Eaton 3S UPS, in standalone mode. Also installs a shutdown
-helper that gracefully stops running VMs/LXCs before the host powers off
-on a critical battery event.
+helper that, on a critical battery event, tells Proxmox to stop all running
+VMs/LXCs with a timeout suited to a dying UPS (Proxmox already stops guests
+on any host shutdown on its own via pve-guests.service - this just pins
+down the timeout instead of trusting your PVE version's own default)
+before the host powers off.
 
 Usage:
   ./install-nut-eaton.sh [options]
@@ -65,7 +70,8 @@ Options:
   --generate-password   Generate random passwords instead of prompting
   --listen-lan          Also listen on all interfaces (default: localhost only;
                          implied by --ha-user, since a VM isn't on loopback)
-  --no-guest-shutdown   Do not install the VM/LXC graceful-shutdown helper
+  --no-guest-shutdown   Skip the timeout helper; fall back to a plain shutdown
+                        (Proxmox's own guest-stop default still applies)
   --uninstall           Remove the NUT config this script created and stop services
   -y, --yes             Do not prompt for confirmation
   -h, --help            Show this help text
@@ -236,7 +242,8 @@ if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
     else
       rm -f "$tmp_helper"
       warn "Could not download the guest shutdown helper; continuing without it."
-      warn "upsmon will shut down the host directly without stopping VMs/LXCs first."
+      warn "Proxmox will still try to stop guests on shutdown via its own default"
+      warn "(pve-guests.service), just without a timeout tuned for a dying UPS battery."
       warn "Re-run with --no-guest-shutdown to silence this warning."
       INSTALL_GUEST_SHUTDOWN=0
     fi
@@ -422,8 +429,8 @@ if [[ $HA_USER_ENABLED -eq 1 ]]; then
 fi
 echo "  Listening on:     127.0.0.1:3493$( [[ $LISTEN_LAN -eq 1 ]] && echo ', 0.0.0.0:3493 (LAN)' )"
 if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
-  echo "  On critical battery: VMs/LXCs are shut down gracefully, then the host powers off"
-  echo "                       (see ${SHUTDOWN_HELPER_DST})."
+  echo "  On critical battery: guests are stopped via Proxmox's own stopall (bounded"
+  echo "                       timeout), then the host powers off (see ${SHUTDOWN_HELPER_DST})."
 fi
 echo
 echo "Test the install with: upsc ${UPS_NAME}@localhost"

@@ -77,7 +77,7 @@ Note on "read-only": NUT's protocol does not gate status reads (GET VAR /
 LIST VAR - what upsc and the Home Assistant integration use) behind
 authentication at all; any client that can reach upsd's LISTEN address can
 read UPS status regardless of credentials. The --ha-user account can't
-authenticate as a monitor master or run control commands (SET/INSTCMD), so
+authenticate as a monitor primary or run control commands (SET/INSTCMD), so
 it can't shut anything down or change UPS settings - but the real fence
 around *who can read* is the LISTEN bind address plus your firewall, not
 this password. See the README for a firewall recommendation.
@@ -319,14 +319,14 @@ cat > "${NUT_ETC}/upsd.users" <<EOF
 # Managed by install-nut-eaton.sh
 [${ADMIN_USER}]
     password = ${ADMIN_PASSWORD}
-    upsmon master
+    upsmon primary
 EOF
 
 if [[ $HA_USER_ENABLED -eq 1 ]]; then
   cat >> "${NUT_ETC}/upsd.users" <<EOF
 
 # Read-only account for Home Assistant's NUT integration: no 'upsmon'
-# directive and no actions/instcmds, so it cannot become monitor master or
+# directive and no actions/instcmds, so it cannot become monitor primary or
 # run control commands. See the note at the top of this script re: NUT not
 # gating status reads (GET VAR/LIST VAR) behind auth at all.
 [${HA_USER_NAME}]
@@ -345,7 +345,7 @@ if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
 fi
 cat > "${NUT_ETC}/upsmon.conf" <<EOF
 # Managed by install-nut-eaton.sh
-MONITOR ${UPS_NAME}@localhost 1 ${ADMIN_USER} ${ADMIN_PASSWORD} master
+MONITOR ${UPS_NAME}@localhost 1 ${ADMIN_USER} ${ADMIN_PASSWORD} primary
 
 MINSUPPLIES 1
 SHUTDOWNCMD "${SHUTDOWN_CMD}"

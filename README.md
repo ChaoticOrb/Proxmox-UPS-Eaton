@@ -35,7 +35,8 @@ Options:
 |---|---|---|
 | `--ups-name NAME` | Name used for the UPS in `ups.conf` | `eaton3s` |
 | `--admin-user USER` | `upsd`/`upsmon` username | `upsmon` |
-| `--admin-password PASS` | Password for `--admin-user` | randomly generated |
+| `--admin-password PASS` | Password for `--admin-user` (skips the prompt) | prompted interactively |
+| `--generate-password` | Generate a random admin password instead of prompting | off |
 | `--listen-lan` | Also listen on all interfaces, not just localhost | off |
 | `--no-guest-shutdown` | Skip installing the VM/LXC graceful-shutdown helper | off |
 | `--uninstall` | Stop services and remove the installed shutdown helper | — |

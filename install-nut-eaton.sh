@@ -13,7 +13,8 @@
 # Options:
 #   --ups-name NAME       Name used for the UPS in ups.conf (default: eaton3s)
 #   --admin-user USER     upsd admin/monitoring username (default: upsmon)
-#   --admin-password PASS Password for --admin-user (default: randomly generated)
+#   --admin-password PASS Password for --admin-user (skips the interactive prompt)
+#   --generate-password   Generate a random admin password instead of prompting
 #   --listen-lan          Also listen on all interfaces (default: localhost only)
 #   --no-guest-shutdown   Do not install the VM/LXC graceful-shutdown helper
 #   --uninstall           Remove the NUT config this script created and stop services
@@ -28,6 +29,7 @@ set -euo pipefail
 UPS_NAME="eaton3s"
 ADMIN_USER="upsmon"
 ADMIN_PASSWORD=""
+GENERATE_PASSWORD=0
 LISTEN_LAN=0
 INSTALL_GUEST_SHUTDOWN=1
 ASSUME_YES=0
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --ups-name) UPS_NAME="$2"; shift 2 ;;
     --admin-user) ADMIN_USER="$2"; shift 2 ;;
     --admin-password) ADMIN_PASSWORD="$2"; shift 2 ;;
+    --generate-password) GENERATE_PASSWORD=1; shift ;;
     --listen-lan) LISTEN_LAN=1; shift ;;
     --no-guest-shutdown) INSTALL_GUEST_SHUTDOWN=0; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -73,6 +76,24 @@ confirm() {
   local prompt="$1"
   read -r -p "${prompt} [y/N] " reply
   [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+prompt_password() {
+  local pass1 pass2
+  while true; do
+    read -r -s -p "Enter password for upsd user '${ADMIN_USER}': " pass1; echo
+    read -r -s -p "Confirm password: " pass2; echo
+    if [[ -z "$pass1" ]]; then
+      echo "Password cannot be empty." >&2
+      continue
+    fi
+    if [[ "$pass1" != "$pass2" ]]; then
+      echo "Passwords did not match, try again." >&2
+      continue
+    fi
+    ADMIN_PASSWORD="$pass1"
+    break
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -122,13 +143,22 @@ apt-get install -y nut usbutils >/dev/null
 id nut >/dev/null 2>&1 || die "nut package installed but 'nut' system user is missing - aborting."
 
 # ---------------------------------------------------------------------------
-# 3. Generate an admin password if one wasn't supplied
+# 3. Determine the admin password: explicit flag > interactive prompt >
+#    random generation (only when --generate-password was requested, or
+#    there's no terminal to prompt on).
 # ---------------------------------------------------------------------------
-if [[ -z "$ADMIN_PASSWORD" ]]; then
+GENERATED_PASSWORD=0
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  :
+elif [[ $GENERATE_PASSWORD -eq 1 ]]; then
   ADMIN_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
   GENERATED_PASSWORD=1
+elif [[ -t 0 ]]; then
+  prompt_password
 else
-  GENERATED_PASSWORD=0
+  warn "No --admin-password given and no terminal to prompt on; generating a random password."
+  ADMIN_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+  GENERATED_PASSWORD=1
 fi
 
 # ---------------------------------------------------------------------------

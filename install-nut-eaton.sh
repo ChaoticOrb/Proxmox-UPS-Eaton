@@ -52,9 +52,14 @@ INSTALL_GUEST_SHUTDOWN=1
 ASSUME_YES=0
 UNINSTALL=0
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# When run from a cloned checkout, BASH_SOURCE[0] points at this file and we
+# copy the helper from next to it. When run via `curl | bash` there is no
+# local checkout (BASH_SOURCE[0] is unset and $0 is just "bash"), so the
+# helper is downloaded from this same repo instead - see step 4 below.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 SHUTDOWN_HELPER_SRC="${SCRIPT_DIR}/scripts/pve-guest-shutdown.sh"
 SHUTDOWN_HELPER_DST="/usr/local/bin/pve-guest-shutdown.sh"
+REPO_RAW_BASE="https://raw.githubusercontent.com/ChaoticOrb/Proxmox-UPS-Eaton/main"
 NUT_ETC="/etc/nut"
 EATON_USB_VENDOR="0463"
 
@@ -185,7 +190,33 @@ apt-get install -y nut usbutils >/dev/null
 id nut >/dev/null 2>&1 || die "nut package installed but 'nut' system user is missing - aborting."
 
 # ---------------------------------------------------------------------------
-# 3. Determine passwords: explicit flag > interactive prompt > random
+# 3. Install the guest graceful-shutdown helper (or fetch it, if we're
+#    running via `curl | bash` with no local checkout to copy it from).
+#    Done before upsmon.conf is written, since that file's SHUTDOWNCMD
+#    depends on whether this succeeded.
+# ---------------------------------------------------------------------------
+if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
+  if [[ -f "$SHUTDOWN_HELPER_SRC" ]]; then
+    log "Installing guest shutdown helper to ${SHUTDOWN_HELPER_DST}..."
+    install -m 0755 -o root -g root "$SHUTDOWN_HELPER_SRC" "$SHUTDOWN_HELPER_DST"
+  else
+    log "No local checkout found - fetching guest shutdown helper from ${REPO_RAW_BASE}..."
+    tmp_helper="$(mktemp)"
+    if command -v curl >/dev/null 2>&1 && curl -fsSL "${REPO_RAW_BASE}/scripts/pve-guest-shutdown.sh" -o "$tmp_helper"; then
+      install -m 0755 -o root -g root "$tmp_helper" "$SHUTDOWN_HELPER_DST"
+      rm -f "$tmp_helper"
+    else
+      rm -f "$tmp_helper"
+      warn "Could not download the guest shutdown helper; continuing without it."
+      warn "upsmon will shut down the host directly without stopping VMs/LXCs first."
+      warn "Re-run with --no-guest-shutdown to silence this warning."
+      INSTALL_GUEST_SHUTDOWN=0
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Determine passwords: explicit flag > interactive prompt > random
 #    generation (only when --generate-password was requested, or there's no
 #    terminal to prompt on). If a read-only Home Assistant account was
 #    requested, it needs the server reachable off-loopback (HA runs in its
@@ -205,7 +236,7 @@ if [[ $HA_USER_ENABLED -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. nut.conf - standalone mode (this node runs driver + server + monitor)
+# 5. nut.conf - standalone mode (this node runs driver + server + monitor)
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/nut.conf..."
 backup_file "${NUT_ETC}/nut.conf"
@@ -214,7 +245,7 @@ MODE=standalone
 EOF
 
 # ---------------------------------------------------------------------------
-# 5. ups.conf - the Eaton 3S is USB HID compliant; usbhid-ups auto-detects it
+# 6. ups.conf - the Eaton 3S is USB HID compliant; usbhid-ups auto-detects it
 #    with port=auto, so no vendor/product ID needs to be hardcoded.
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/ups.conf (UPS name: ${UPS_NAME})..."
@@ -230,7 +261,7 @@ maxretry = 3
 EOF
 
 # ---------------------------------------------------------------------------
-# 6. upsd.conf - who can connect to the data server
+# 7. upsd.conf - who can connect to the data server
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/upsd.conf..."
 backup_file "${NUT_ETC}/upsd.conf"
@@ -250,7 +281,7 @@ if [[ $LISTEN_LAN -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. upsd.users - credentials for clients connecting to upsd
+# 8. upsd.users - credentials for clients connecting to upsd
 # ---------------------------------------------------------------------------
 HA_USER_LOG_SUFFIX=""
 [[ $HA_USER_ENABLED -eq 1 ]] && HA_USER_LOG_SUFFIX=", ${HA_USER_NAME}"
@@ -276,7 +307,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 8. upsmon.conf - local monitoring + shutdown trigger
+# 9. upsmon.conf - local monitoring + shutdown trigger
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/upsmon.conf..."
 backup_file "${NUT_ETC}/upsmon.conf"
@@ -301,22 +332,13 @@ FINALDELAY 5
 EOF
 
 # ---------------------------------------------------------------------------
-# 9. Fix ownership/permissions (NUT is picky about this)
+# 10. Fix ownership/permissions (NUT is picky about this)
 # ---------------------------------------------------------------------------
 log "Setting ownership and permissions on ${NUT_ETC}..."
 chown root:nut "${NUT_ETC}"/nut.conf "${NUT_ETC}"/ups.conf "${NUT_ETC}"/upsd.conf \
   "${NUT_ETC}"/upsd.users "${NUT_ETC}"/upsmon.conf
 chmod 640 "${NUT_ETC}"/ups.conf "${NUT_ETC}"/upsd.conf "${NUT_ETC}"/upsd.users "${NUT_ETC}"/upsmon.conf
 chmod 644 "${NUT_ETC}"/nut.conf
-
-# ---------------------------------------------------------------------------
-# 10. Install the guest graceful-shutdown helper
-# ---------------------------------------------------------------------------
-if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
-  [[ -f "$SHUTDOWN_HELPER_SRC" ]] || die "Missing ${SHUTDOWN_HELPER_SRC} - re-clone the repo."
-  log "Installing guest shutdown helper to ${SHUTDOWN_HELPER_DST}..."
-  install -m 0755 -o root -g root "$SHUTDOWN_HELPER_SRC" "$SHUTDOWN_HELPER_DST"
-fi
 
 # ---------------------------------------------------------------------------
 # 11. Enable and start services

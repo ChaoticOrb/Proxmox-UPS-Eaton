@@ -6,6 +6,49 @@ on a Proxmox VE node with a USB-connected Eaton 3S UPS.
 The Eaton 3S is USB-HID compliant, so NUT's `usbhid-ups` driver auto-detects
 it with `port = auto` — no vendor/product IDs need to be hardcoded.
 
+> [!WARNING]
+> **Piping a script straight from the internet into `bash` runs it with root
+> privileges before you've looked at a single line of it.** That's true of
+> the one-liner below, and of any `curl | bash` command from any source, not
+> just this repo. Read the script first — either open
+> [`install-nut-eaton.sh`](install-nut-eaton.sh) and
+> [`scripts/pve-guest-shutdown.sh`](scripts/pve-guest-shutdown.sh) on GitHub,
+> or download before executing (see below) — before you trust it with root
+> on your Proxmox node.
+
+## Quick install
+
+Review the script first (see the warning above), then, as root on the
+Proxmox node with the UPS plugged in:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChaoticOrb/Proxmox-UPS-Eaton/main/install-nut-eaton.sh | bash
+```
+
+To pass flags (e.g. to also set up the [Home Assistant read-only
+account](#home-assistant-integration)), use `bash -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChaoticOrb/Proxmox-UPS-Eaton/main/install-nut-eaton.sh | bash -s -- --ha-user
+```
+
+Not running as root already? Pipe into `sudo bash` instead of `bash`.
+
+To actually read the script before it runs, rather than trusting it sight
+unseen, download it first and inspect it, then run the local copy:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChaoticOrb/Proxmox-UPS-Eaton/main/install-nut-eaton.sh -o install-nut-eaton.sh
+less install-nut-eaton.sh   # read it
+chmod +x install-nut-eaton.sh
+sudo ./install-nut-eaton.sh
+```
+
+When run this way (no local git checkout), the script also fetches
+`scripts/pve-guest-shutdown.sh` from this repo on demand for the same
+reason; `git clone`-ing the repo instead (see below) avoids any of that
+happening at install time.
+
 ## What it does
 
 - Installs the `nut` package.
@@ -26,11 +69,19 @@ it with `port = auto` — no vendor/product IDs need to be hardcoded.
 
 ## Usage
 
-Run as root on the Proxmox node with the UPS connected via USB:
+The most reviewable way to run this: clone the repo, read the code, then run
+your own local copy as root on the Proxmox node with the UPS connected via
+USB.
 
 ```sh
-./install-nut-eaton.sh
+git clone https://github.com/ChaoticOrb/Proxmox-UPS-Eaton.git
+cd Proxmox-UPS-Eaton
+sudo ./install-nut-eaton.sh
 ```
+
+(See [Quick install](#quick-install) above for a one-line `curl | bash`
+alternative, and the warning there about the risk of running any script that
+way without reading it first.)
 
 Options:
 

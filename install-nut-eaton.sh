@@ -7,36 +7,7 @@
 # helper that gracefully stops running VMs/LXCs before the host powers off
 # on a critical battery event.
 #
-# Usage:
-#   ./install-nut-eaton.sh [options]
-#
-# Options:
-#   --ups-name NAME       Name used for the UPS in ups.conf (default: eaton3s)
-#   --admin-user USER     upsd admin/monitoring username (default: upsmon)
-#   --admin-password PASS Password for --admin-user (skips the interactive prompt)
-#   --ha-user              Create a second, read-only upsd account for Home
-#                          Assistant's NUT integration (name: homeassistant)
-#   --ha-user-name NAME    Override the Home Assistant account name
-#   --ha-password PASS     Password for the Home Assistant account (skips prompt)
-#   --generate-password   Generate random passwords instead of prompting
-#   --listen-lan          Also listen on all interfaces (default: localhost only;
-#                          implied by --ha-user, since a VM isn't on loopback)
-#   --no-guest-shutdown   Do not install the VM/LXC graceful-shutdown helper
-#   --uninstall           Remove the NUT config this script created and stop services
-#   -y, --yes             Do not prompt for confirmation
-#   -h, --help            Show this help text
-#
-# Re-running this script is safe: existing config files are backed up with a
-# .bak-<timestamp> suffix before being rewritten.
-#
-# Note on "read-only": NUT's protocol does not gate status reads (GET VAR /
-# LIST VAR - what upsc and the Home Assistant integration use) behind
-# authentication at all; any client that can reach upsd's LISTEN address can
-# read UPS status regardless of credentials. The --ha-user account can't
-# authenticate as a monitor master or run control commands (SET/INSTCMD), so
-# it can't shut anything down or change UPS settings - but the real fence
-# around *who can read* is the LISTEN bind address plus your firewall, not
-# this password. See the README for a firewall recommendation.
+# Run with --help (or see usage() below) for the full option list.
 
 set -euo pipefail
 
@@ -67,7 +38,51 @@ log()  { echo "[nut-setup] $*"; }
 warn() { echo "[nut-setup] WARNING: $*" >&2; }
 die()  { echo "[nut-setup] ERROR: $*" >&2; exit 1; }
 
-usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; }
+# Self-contained (doesn't read "$0"): under `curl | bash -s -- --help`, $0 is
+# just "bash", not this file, so re-parsing our own source for the help text
+# would silently fail there.
+usage() {
+  cat <<'EOF'
+install-nut-eaton.sh
+
+Installs and configures Network UPS Tools (NUT) on a Proxmox VE node for a
+USB-connected Eaton 3S UPS, in standalone mode. Also installs a shutdown
+helper that gracefully stops running VMs/LXCs before the host powers off
+on a critical battery event.
+
+Usage:
+  ./install-nut-eaton.sh [options]
+
+Options:
+  --ups-name NAME       Name used for the UPS in ups.conf (default: eaton3s)
+  --admin-user USER     upsd admin/monitoring username (default: upsmon)
+  --admin-password PASS Password for --admin-user (skips the interactive prompt)
+  --ha-user              Create a second, read-only upsd account for Home
+                         Assistant's NUT integration (name: homeassistant)
+  --ha-user-name NAME    Override the Home Assistant account name (must
+                         differ from --admin-user)
+  --ha-password PASS     Password for the Home Assistant account (skips prompt)
+  --generate-password   Generate random passwords instead of prompting
+  --listen-lan          Also listen on all interfaces (default: localhost only;
+                         implied by --ha-user, since a VM isn't on loopback)
+  --no-guest-shutdown   Do not install the VM/LXC graceful-shutdown helper
+  --uninstall           Remove the NUT config this script created and stop services
+  -y, --yes             Do not prompt for confirmation
+  -h, --help            Show this help text
+
+Re-running this script is safe: existing config files are backed up with a
+.bak-<timestamp> suffix before being rewritten.
+
+Note on "read-only": NUT's protocol does not gate status reads (GET VAR /
+LIST VAR - what upsc and the Home Assistant integration use) behind
+authentication at all; any client that can reach upsd's LISTEN address can
+read UPS status regardless of credentials. The --ha-user account can't
+authenticate as a monitor master or run control commands (SET/INSTCMD), so
+it can't shut anything down or change UPS settings - but the real fence
+around *who can read* is the LISTEN bind address plus your firewall, not
+this password. See the README for a firewall recommendation.
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,6 +105,10 @@ done
 [[ $EUID -eq 0 ]] || die "Must be run as root (use sudo)."
 command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Proxmox (apt-get not found)."
 
+if [[ $HA_USER_ENABLED -eq 1 && "$HA_USER_NAME" == "$ADMIN_USER" ]]; then
+  die "--ha-user-name '${HA_USER_NAME}' is the same as --admin-user; upsd.users needs two distinct account names (pick a different --ha-user-name or --admin-user)."
+fi
+
 backup_file() {
   local f="$1"
   [[ -f "$f" ]] || return 0
@@ -99,6 +118,15 @@ backup_file() {
 confirm() {
   [[ $ASSUME_YES -eq 1 ]] && return 0
   local prompt="$1"
+  if [[ ! -t 0 ]]; then
+    # No terminal to ask on (e.g. running via `curl | bash`) - reading from
+    # stdin here would consume bytes the shell still needs to parse the rest
+    # of this piped script, corrupting execution. Proceed instead of hanging
+    # or reading garbage; re-run with -y to make this explicit and silence
+    # the warning, or Ctrl-C now to abort.
+    warn "No terminal to confirm on; proceeding automatically (re-run with -y to silence this)."
+    return 0
+  fi
   read -r -p "${prompt} [y/N] " reply
   [[ "$reply" =~ ^[Yy]$ ]]
 }
@@ -366,16 +394,18 @@ systemctl restart nut-monitor.service
 # ---------------------------------------------------------------------------
 log "Checking driver/server status..."
 sleep 2
-if command -v upsc >/dev/null 2>&1 && upsc "${UPS_NAME}@localhost" >/tmp/upsc-check.$$ 2>&1; then
+# mktemp, not a fixed /tmp/...$$ path: this runs as root and a predictable
+# world-writable-directory filename is a classic symlink-attack target.
+upsc_check_file="$(mktemp)"
+if command -v upsc >/dev/null 2>&1 && upsc "${UPS_NAME}@localhost" >"$upsc_check_file" 2>&1; then
   log "UPS is reporting data:"
-  sed -n '1,8p' /tmp/upsc-check.$$ | sed 's/^/[nut-setup]   /'
-  rm -f /tmp/upsc-check.$$
+  sed -n '1,8p' "$upsc_check_file" | sed 's/^/[nut-setup]   /'
 else
   warn "Could not query '${UPS_NAME}@localhost' yet. This is expected if the UPS isn't plugged in."
   warn "Once it is connected, check with: upsc ${UPS_NAME}@localhost"
   warn "and driver logs with: journalctl -u nut-server -u 'nut-driver@${UPS_NAME}' -n 50"
-  rm -f /tmp/upsc-check.$$
 fi
+rm -f "$upsc_check_file"
 
 log "Done."
 echo

@@ -1,5 +1,11 @@
 # Proxmox-UPS-Eaton
 
+> This was built for one person's specific homelab setup and requirements,
+> not as a general-purpose or officially supported tool. Read it, understand
+> what it does to your system, and adjust it for your own environment before
+> running it — be especially careful on a production deployment, or if you
+> don't have solid backups to fall back on.
+
 A script for installing and configuring [NUT (Network UPS Tools)](https://networkupstools.org/)
 on a Proxmox VE node with a USB-connected Eaton 3S UPS.
 

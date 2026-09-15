@@ -236,3 +236,10 @@ stopping your actual guests along the way.
 See the "Never test with `upsmon -c fsd`" warning under [Email
 alerting](#email-alerting) above — the same danger applies here too, since
 it's the same `SHUTDOWNCMD`/`primary` mechanism.
+
+## License
+
+[MIT](LICENSE) — use it, fork it, change it, no strings attached beyond
+keeping the copyright notice. See the caveat at the top of this README
+though: it was built for one specific setup, so review it for your own
+before relying on it.

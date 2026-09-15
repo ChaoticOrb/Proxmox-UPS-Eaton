@@ -57,6 +57,9 @@ happening at install time.
 - Creates an `upsd` user for `upsmon` to authenticate with, and defaults to
   listening on `localhost` only (pass `--listen-lan` to also listen on all
   interfaces if another host needs to poll this UPS over the network).
+  Passwords are never prompted for — they're randomly generated and printed
+  once at the end of the install (pass `--admin-password`/`--ha-password`
+  to set one explicitly instead).
 - Optionally (`--ha-user`) creates a second `upsd` account for Home
   Assistant's NUT integration, with no monitor/control privileges — see
   [Home Assistant integration](#home-assistant-integration) below.
@@ -99,11 +102,10 @@ Options:
 |---|---|---|
 | `--ups-name NAME` | Name used for the UPS in `ups.conf` | `eaton3s` |
 | `--admin-user USER` | `upsd`/`upsmon` username | `upsmon` |
-| `--admin-password PASS` | Password for `--admin-user` (skips the prompt) | prompted interactively |
+| `--admin-password PASS` | Password for `--admin-user` | randomly generated, printed at the end |
 | `--ha-user` | Create a read-only account for Home Assistant | off |
 | `--ha-user-name NAME` | Home Assistant account name (implies `--ha-user`) | `homeassistant` |
-| `--ha-password PASS` | Password for the Home Assistant account (skips the prompt, implies `--ha-user`) | prompted interactively |
-| `--generate-password` | Generate random passwords instead of prompting | off |
+| `--ha-password PASS` | Password for the Home Assistant account (implies `--ha-user`) | randomly generated, printed at the end |
 | `--listen-lan` | Also listen on all interfaces, not just localhost (implied by `--ha-user`) | off |
 | `--no-guest-shutdown` | Skip the timeout helper (Proxmox's own default guest-stop still applies) | off |
 | `--no-notify` | Skip setting up email alerting on UPS events | off |

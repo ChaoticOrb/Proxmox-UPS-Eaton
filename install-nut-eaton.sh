@@ -20,7 +20,6 @@ ADMIN_PASSWORD=""
 HA_USER_ENABLED=0
 HA_USER_NAME="homeassistant"
 HA_PASSWORD=""
-GENERATE_PASSWORD=0
 LISTEN_LAN=0
 INSTALL_GUEST_SHUTDOWN=1
 INSTALL_NOTIFY=1
@@ -64,13 +63,14 @@ Usage:
 Options:
   --ups-name NAME       Name used for the UPS in ups.conf (default: eaton3s)
   --admin-user USER     upsd admin/monitoring username (default: upsmon)
-  --admin-password PASS Password for --admin-user (skips the interactive prompt)
+  --admin-password PASS Password for --admin-user (default: randomly generated
+                        and printed at the end - see below)
   --ha-user              Create a second, read-only upsd account for Home
                          Assistant's NUT integration (name: homeassistant)
   --ha-user-name NAME    Override the Home Assistant account name (must
                          differ from --admin-user)
-  --ha-password PASS     Password for the Home Assistant account (skips prompt)
-  --generate-password   Generate random passwords instead of prompting
+  --ha-password PASS     Password for the Home Assistant account (default:
+                         randomly generated and printed at the end)
   --listen-lan          Also listen on all interfaces (default: localhost only;
                          implied by --ha-user, since a VM isn't on loopback)
   --no-guest-shutdown   Skip the timeout helper; fall back to a plain shutdown
@@ -84,7 +84,9 @@ Options:
 Re-running this script is safe: existing config files are backed up with a
 .bak-<timestamp> suffix before being rewritten, and a full snapshot of
 /etc/nut is additionally saved to /root/nut-config-backup-<timestamp>.tar.gz
-before anything is touched.
+before anything is touched. Note that re-running without --admin-password/
+--ha-password generates and sets a NEW random password each time - pass
+them explicitly if you want re-runs to keep the same credentials.
 
 Note on "read-only": NUT's protocol does not gate status reads (GET VAR /
 LIST VAR - what upsc and the Home Assistant integration use) behind
@@ -110,7 +112,6 @@ while [[ $# -gt 0 ]]; do
     --ha-user) HA_USER_ENABLED=1; shift ;;
     --ha-user-name) HA_USER_ENABLED=1; HA_USER_NAME="$2"; shift 2 ;;
     --ha-password) HA_USER_ENABLED=1; HA_PASSWORD="$2"; shift 2 ;;
-    --generate-password) GENERATE_PASSWORD=1; shift ;;
     --listen-lan) LISTEN_LAN=1; shift ;;
     --no-guest-shutdown) INSTALL_GUEST_SHUTDOWN=0; shift ;;
     --no-notify) INSTALL_NOTIFY=0; shift ;;
@@ -151,41 +152,18 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-prompt_password() {
-  # $1 = variable name to assign into, $2 = human-readable label for the prompt
-  local outvar="$1" label="$2" pass1 pass2
-  while true; do
-    read -r -s -p "Enter password for ${label}: " pass1; echo
-    read -r -s -p "Confirm password: " pass2; echo
-    if [[ -z "$pass1" ]]; then
-      echo "Password cannot be empty." >&2
-      continue
-    fi
-    if [[ "$pass1" != "$pass2" ]]; then
-      echo "Passwords did not match, try again." >&2
-      continue
-    fi
-    printf -v "$outvar" '%s' "$pass1"
-    break
-  done
-}
-
-# Resolves a password into $1 from (in order): an explicit value already
-# supplied, an interactive prompt, or a random string. Sets
-# LAST_PASSWORD_GENERATED=1 when it had to generate one (no explicit value
-# and either --generate-password was passed or there's no terminal).
+# Resolves a password into $1: an explicit value already supplied (e.g.
+# --admin-password), or a random one. Never prompts - this script is meant
+# to run unattended (including piped via `curl | bash`, where interactive
+# input isn't safe to read at all - see confirm() above). Sets
+# LAST_PASSWORD_GENERATED=1 when it had to generate one, so callers know
+# whether it's safe/necessary to print the password back at the end.
 resolve_password() {
-  local outvar="$1" explicit="$2" label="$3"
-  LAST_PASSWORD_GENERATED=0
+  local outvar="$1" explicit="$2"
   if [[ -n "$explicit" ]]; then
     printf -v "$outvar" '%s' "$explicit"
-  elif [[ $GENERATE_PASSWORD -eq 1 ]]; then
-    printf -v "$outvar" '%s' "$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
-    LAST_PASSWORD_GENERATED=1
-  elif [[ -t 0 ]]; then
-    prompt_password "$outvar" "$label"
+    LAST_PASSWORD_GENERATED=0
   else
-    warn "No password given for ${label} and no terminal to prompt on; generating a random password."
     printf -v "$outvar" '%s' "$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
     LAST_PASSWORD_GENERATED=1
   fi
@@ -309,17 +287,17 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Determine passwords: explicit flag > interactive prompt > random
-#    generation (only when --generate-password was requested, or there's no
-#    terminal to prompt on). If a read-only Home Assistant account was
-#    requested, it needs the server reachable off-loopback (HA runs in its
-#    own VM), so imply --listen-lan unless the user already set it.
+# 7. Determine passwords: explicit --admin-password/--ha-password if given,
+#    otherwise randomly generated (never prompted - see resolve_password()
+#    above) and printed at the end. If a read-only Home Assistant account
+#    was requested, it needs the server reachable off-loopback (HA runs in
+#    its own VM), so imply --listen-lan unless the user already set it.
 # ---------------------------------------------------------------------------
-resolve_password ADMIN_PASSWORD "$ADMIN_PASSWORD" "upsd user '${ADMIN_USER}'"
+resolve_password ADMIN_PASSWORD "$ADMIN_PASSWORD"
 GENERATED_ADMIN_PASSWORD=$LAST_PASSWORD_GENERATED
 
 if [[ $HA_USER_ENABLED -eq 1 ]]; then
-  resolve_password HA_PASSWORD "$HA_PASSWORD" "Home Assistant read-only user '${HA_USER_NAME}'"
+  resolve_password HA_PASSWORD "$HA_PASSWORD"
   GENERATED_HA_PASSWORD=$LAST_PASSWORD_GENERATED
 
   if [[ $LISTEN_LAN -eq 0 ]]; then
@@ -504,17 +482,28 @@ rm -f "$upsc_check_file"
 
 log "Done."
 echo
-echo "  UPS name:         ${UPS_NAME}"
-echo "  upsd admin user:  ${ADMIN_USER}"
+echo "=========================================================================="
+echo "  CREDENTIALS - save these now. Generated passwords are only ever shown"
+echo "  here; they're also in ${NUT_ETC}/upsd.users (root:nut, mode 640) if you"
+echo "  need them again, but nothing prints them a second time."
+echo "=========================================================================="
+echo "  UPS name:          ${UPS_NAME}"
+echo "  upsd admin user:   ${ADMIN_USER}"
 if [[ $GENERATED_ADMIN_PASSWORD -eq 1 ]]; then
-  echo "  upsd admin pass:  ${ADMIN_PASSWORD}   (generated - stored in ${NUT_ETC}/upsd.users)"
+  echo "  upsd admin pass:   ${ADMIN_PASSWORD}"
+else
+  echo "  upsd admin pass:   (set via --admin-password, not repeated here)"
 fi
 if [[ $HA_USER_ENABLED -eq 1 ]]; then
   echo "  HA read-only user: ${HA_USER_NAME}"
   if [[ $GENERATED_HA_PASSWORD -eq 1 ]]; then
-    echo "  HA read-only pass: ${HA_PASSWORD}   (generated - stored in ${NUT_ETC}/upsd.users)"
+    echo "  HA read-only pass: ${HA_PASSWORD}"
+  else
+    echo "  HA read-only pass: (set via --ha-password, not repeated here)"
   fi
 fi
+echo "=========================================================================="
+echo
 echo "  Listening on:     127.0.0.1:3493$( [[ $LISTEN_LAN -eq 1 ]] && echo ', 0.0.0.0:3493 (LAN)' )"
 if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
   echo "  On critical battery: guests are stopped via Proxmox's own stopall (bounded"

@@ -65,8 +65,17 @@ happening at install time.
   explicit, bounded timeout before powering off the host — see [Why the
   shutdown helper exists](#why-the-shutdown-helper-exists) below for why
   this isn't just Proxmox's own default shutdown behavior.
-- Backs up any existing NUT config files it touches before overwriting them,
-  so it's safe to re-run.
+- Sets up email alerting (`/etc/nut/notify.sh`) for UPS events — on
+  battery, low battery, comms lost, etc — see [Email
+  alerting](#email-alerting) below, including a critical warning about how
+  *not* to test it.
+- Reloads and retriggers udev rules after installing the `nut` package, so
+  a UPS that was already plugged in before this ran gets its USB
+  permissions fixed too, not just ones plugged in afterward.
+- Backs up any existing NUT config files it touches before overwriting them
+  (a per-file `.bak-<timestamp>`), and additionally snapshots the whole of
+  `/etc/nut` to `/root/nut-config-backup-<timestamp>.tar.gz` before making
+  any changes at all — so it's safe to re-run.
 
 ## Usage
 
@@ -97,6 +106,8 @@ Options:
 | `--generate-password` | Generate random passwords instead of prompting | off |
 | `--listen-lan` | Also listen on all interfaces, not just localhost (implied by `--ha-user`) | off |
 | `--no-guest-shutdown` | Skip the timeout helper (Proxmox's own default guest-stop still applies) | off |
+| `--no-notify` | Skip setting up email alerting on UPS events | off |
+| `--notify-email ADDR` | Local mail recipient for alerts (implies alerting is on) | `root` |
 | `--uninstall` | Stop services and remove the installed shutdown helper | — |
 | `-y`, `--yes` | Don't prompt for confirmation | off |
 | `-h`, `--help` | Show help | — |
@@ -159,6 +170,42 @@ sequential, the worst-case total time scales with your guest count — with
 close to a dozen VMs/LXCs, that's worth testing for yourself (see below)
 rather than assuming.
 
+## Email alerting
+
+By default the install writes `/etc/nut/notify.sh`, which mails
+`--notify-email` (default `root`) on UPS state-change events — power lost,
+power restored, low battery, forced shutdown, communication lost/restored,
+etc. `--no-notify` skips this entirely.
+
+This assumes root's local mail already relays somewhere you'll actually see
+it. The script has no way to confirm that for you — check it yourself:
+
+```sh
+echo test | mail -s test root
+```
+
+If that doesn't arrive anywhere, fix local mail relay first (or replace the
+one line in `/etc/nut/notify.sh` with something else — e.g. a `curl` to a
+push service — the rest of the wiring, `NOTIFYCMD`/`NOTIFYFLAG` in
+`upsmon.conf`, doesn't care what the script does).
+
+### ⚠️ Never test with `upsmon -c fsd`
+
+`upsmon -c fsd` is **not a safe way to test this.** On a `primary` instance
+(this one) it sets the real forced-shutdown flag, which — combined with
+`SHUTDOWNCMD` — triggers an actual shutdown of the host, and of the UPS
+itself via the driver. This has actually happened during this project's own
+manual testing and caused an unplanned reboot of the node it was run on.
+
+To test the alert path itself, safely, without touching shutdown logic at
+all:
+
+```sh
+NOTIFYTYPE=ONBATT /etc/nut/notify.sh "test message"
+```
+
+Confirm the email arrives with subject `NUT: ONBATT on <hostname>`.
+
 ## Verifying the install
 
 ```sh
@@ -166,11 +213,24 @@ upsc eaton3s@localhost
 ```
 
 This should print battery charge, status, and other data reported by the
-UPS. If it doesn't, check driver logs:
+UPS. If it doesn't:
 
 ```sh
-journalctl -u nut-server -u 'nut-driver@eaton3s' -n 50
+systemctl status nut-driver@eaton3s
+journalctl -u nut-driver@eaton3s -n 50
 ```
+
+The driver runs as its own systemd unit, separate from `nut-server` and
+`nut-monitor` — restarting those two doesn't start or restart it, and the
+install script checks it explicitly for this reason. The most common
+failure at this stage is a USB permissions error in that log
+(`insufficient permissions on everything` or similar): the `nut` package's
+udev rule only takes effect for USB devices enumerated *after* the rule
+exists on disk, so a UPS that was already plugged in before you first ran
+this script can still show up as root-owned rather than group `nut`. The
+script reloads and retriggers udev rules on every run to cover this, but if
+it still doesn't take, unplug and re-plug the UPS (or reboot) and try
+again.
 
 ## Testing the shutdown path
 

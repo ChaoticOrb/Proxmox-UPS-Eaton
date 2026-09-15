@@ -3,12 +3,11 @@
 # install-nut-eaton.sh
 #
 # Installs and configures Network UPS Tools (NUT) on a Proxmox VE node for a
-# USB-connected Eaton 3S UPS, in standalone mode. Also installs a shutdown
-# helper that, on a critical battery event, tells Proxmox to stop all
-# running VMs/LXCs with a timeout suited to a dying UPS (rather than
-# whatever your PVE version's own default happens to be) before the host
-# powers off, and sets up email alerting on UPS events (on battery, low
-# battery, comms lost, etc).
+# USB-connected Eaton 3S UPS, in standalone mode. On a critical battery
+# event, upsmon triggers a plain host shutdown; Proxmox's own
+# pve-guests.service stops all running VMs/LXCs as part of that automatically
+# - no extra script needed for that. Also sets up email alerting on UPS
+# events (on battery, low battery, comms lost, etc).
 #
 # Run with --help (or see usage() below) for the full option list.
 
@@ -21,20 +20,11 @@ HA_USER_ENABLED=0
 HA_USER_NAME="homeassistant"
 HA_PASSWORD=""
 LISTEN_LAN=0
-INSTALL_GUEST_SHUTDOWN=1
 INSTALL_NOTIFY=1
 NOTIFY_EMAIL="root"
 ASSUME_YES=0
 UNINSTALL=0
 
-# When run from a cloned checkout, BASH_SOURCE[0] points at this file and we
-# copy the helper from next to it. When run via `curl | bash` there is no
-# local checkout (BASH_SOURCE[0] is unset and $0 is just "bash"), so the
-# helper is downloaded from this same repo instead - see step 5 below.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
-SHUTDOWN_HELPER_SRC="${SCRIPT_DIR}/scripts/pve-guest-shutdown.sh"
-SHUTDOWN_HELPER_DST="/usr/local/bin/pve-guest-shutdown.sh"
-REPO_RAW_BASE="https://raw.githubusercontent.com/ChaoticOrb/Proxmox-UPS-Eaton/main"
 NUT_ETC="/etc/nut"
 EATON_USB_VENDOR="0463"
 
@@ -50,12 +40,10 @@ usage() {
 install-nut-eaton.sh
 
 Installs and configures Network UPS Tools (NUT) on a Proxmox VE node for a
-USB-connected Eaton 3S UPS, in standalone mode. Also installs a shutdown
-helper that, on a critical battery event, tells Proxmox to stop all running
-VMs/LXCs with a timeout suited to a dying UPS (Proxmox already stops guests
-on any host shutdown on its own via pve-guests.service - this just pins
-down the timeout instead of trusting your PVE version's own default)
-before the host powers off, and sets up email alerting on UPS events.
+USB-connected Eaton 3S UPS, in standalone mode. On a critical battery event,
+upsmon triggers a plain host shutdown; Proxmox's own pve-guests.service
+stops all running VMs/LXCs as part of that automatically - no extra script
+needed for that. Also sets up email alerting on UPS events.
 
 Usage:
   ./install-nut-eaton.sh [options]
@@ -73,8 +61,6 @@ Options:
                          randomly generated and printed at the end)
   --listen-lan          Also listen on all interfaces (default: localhost only;
                          implied by --ha-user, since a VM isn't on loopback)
-  --no-guest-shutdown   Skip the timeout helper; fall back to a plain shutdown
-                        (Proxmox's own guest-stop default still applies)
   --no-notify           Skip setting up email alerting on UPS events
   --notify-email ADDR    Local mail recipient for alerts (default: root)
   --uninstall           Remove the NUT config this script created and stop services
@@ -113,7 +99,6 @@ while [[ $# -gt 0 ]]; do
     --ha-user-name) HA_USER_ENABLED=1; HA_USER_NAME="$2"; shift 2 ;;
     --ha-password) HA_USER_ENABLED=1; HA_PASSWORD="$2"; shift 2 ;;
     --listen-lan) LISTEN_LAN=1; shift ;;
-    --no-guest-shutdown) INSTALL_GUEST_SHUTDOWN=0; shift ;;
     --no-notify) INSTALL_NOTIFY=0; shift ;;
     --notify-email) INSTALL_NOTIFY=1; NOTIFY_EMAIL="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -181,7 +166,7 @@ if [[ $UNINSTALL -eq 1 ]]; then
     systemctl disable "nut-driver@${UPS_NAME}.service" 2>/dev/null || true
   fi
   upsdrvctl stop 2>/dev/null || true
-  rm -f "$SHUTDOWN_HELPER_DST"
+  rm -f /usr/local/bin/pve-guest-shutdown.sh
   log "NUT configuration left in place under ${NUT_ETC} (remove manually or 'apt purge nut' if desired)."
   log "Uninstall steps complete."
   exit 0
@@ -243,31 +228,13 @@ if [[ -d "$NUT_ETC" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Install the guest graceful-shutdown helper (or fetch it, if we're
-#    running via `curl | bash` with no local checkout to copy it from).
-#    Done before upsmon.conf is written, since that file's SHUTDOWNCMD
-#    depends on whether this succeeded.
+# 5. Remove a guest-shutdown helper from an older version of this script, if
+#    present. Proxmox's own pve-guests.service already stops all running
+#    guests on any host shutdown (including the plain one SHUTDOWNCMD
+#    triggers below) with no extra script needed - re-implementing that by
+#    hand was more complexity than it was worth.
 # ---------------------------------------------------------------------------
-if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
-  if [[ -f "$SHUTDOWN_HELPER_SRC" ]]; then
-    log "Installing guest shutdown helper to ${SHUTDOWN_HELPER_DST}..."
-    install -m 0755 -o root -g root "$SHUTDOWN_HELPER_SRC" "$SHUTDOWN_HELPER_DST"
-  else
-    log "No local checkout found - fetching guest shutdown helper from ${REPO_RAW_BASE}..."
-    tmp_helper="$(mktemp)"
-    if command -v curl >/dev/null 2>&1 && curl -fsSL "${REPO_RAW_BASE}/scripts/pve-guest-shutdown.sh" -o "$tmp_helper"; then
-      install -m 0755 -o root -g root "$tmp_helper" "$SHUTDOWN_HELPER_DST"
-      rm -f "$tmp_helper"
-    else
-      rm -f "$tmp_helper"
-      warn "Could not download the guest shutdown helper; continuing without it."
-      warn "Proxmox will still try to stop guests on shutdown via its own default"
-      warn "(pve-guests.service), just without a timeout tuned for a dying UPS battery."
-      warn "Re-run with --no-guest-shutdown to silence this warning."
-      INSTALL_GUEST_SHUTDOWN=0
-    fi
-  fi
-fi
+rm -f /usr/local/bin/pve-guest-shutdown.sh
 
 # ---------------------------------------------------------------------------
 # 6. notify.sh - mails NOTIFY_EMAIL on UPS state-change events (on battery,
@@ -382,10 +349,10 @@ fi
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/upsmon.conf..."
 backup_file "${NUT_ETC}/upsmon.conf"
-SHUTDOWN_CMD="/sbin/shutdown -h +0 \"UPS battery critical\""
-if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
-  SHUTDOWN_CMD="${SHUTDOWN_HELPER_DST}"
-fi
+# Plain host shutdown - Proxmox's own pve-guests.service stops all running
+# guests as part of any normal shutdown sequence, this included, with no
+# extra script needed (see the note at the top of this script).
+SHUTDOWN_CMD="/sbin/shutdown -h +0 UPS battery critical"
 NOTIFY_LINES="NOTIFYCMD /usr/sbin/upssched"
 if [[ $INSTALL_NOTIFY -eq 1 ]]; then
   NOTIFY_LINES="NOTIFYCMD ${NUT_ETC}/notify.sh
@@ -505,10 +472,8 @@ fi
 echo "=========================================================================="
 echo
 echo "  Listening on:     127.0.0.1:3493$( [[ $LISTEN_LAN -eq 1 ]] && echo ', 0.0.0.0:3493 (LAN)' )"
-if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
-  echo "  On critical battery: guests are stopped via Proxmox's own stopall (bounded"
-  echo "                       timeout), then the host powers off (see ${SHUTDOWN_HELPER_DST})."
-fi
+echo "  On critical battery: host shuts down (Proxmox's pve-guests.service stops"
+echo "                       all running guests first, automatically)."
 if [[ $INSTALL_NOTIFY -eq 1 ]]; then
   echo "  Alerting:         emails ${NOTIFY_EMAIL} on UPS events (see ${NUT_ETC}/notify.sh)"
 fi

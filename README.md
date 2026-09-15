@@ -11,10 +11,9 @@ it with `port = auto` — no vendor/product IDs need to be hardcoded.
 > privileges before you've looked at a single line of it.** That's true of
 > the one-liner below, and of any `curl | bash` command from any source, not
 > just this repo. Read the script first — either open
-> [`install-nut-eaton.sh`](install-nut-eaton.sh) and
-> [`scripts/pve-guest-shutdown.sh`](scripts/pve-guest-shutdown.sh) on GitHub,
-> or download before executing (see below) — before you trust it with root
-> on your Proxmox node.
+> [`install-nut-eaton.sh`](install-nut-eaton.sh) on GitHub, or download
+> before executing (see below) — before you trust it with root on your
+> Proxmox node.
 
 ## Quick install
 
@@ -44,11 +43,6 @@ chmod +x install-nut-eaton.sh
 sudo ./install-nut-eaton.sh
 ```
 
-When run this way (no local git checkout), the script also fetches
-`scripts/pve-guest-shutdown.sh` from this repo on demand for the same
-reason; `git clone`-ing the repo instead (see below) avoids any of that
-happening at install time.
-
 ## What it does
 
 - Installs the `nut` package.
@@ -63,11 +57,11 @@ happening at install time.
 - Optionally (`--ha-user`) creates a second `upsd` account for Home
   Assistant's NUT integration, with no monitor/control privileges — see
   [Home Assistant integration](#home-assistant-integration) below.
-- Installs a shutdown helper (`scripts/pve-guest-shutdown.sh`) that, on a
-  critical battery event, stops all running VMs and LXC containers with an
-  explicit, bounded timeout before powering off the host — see [Why the
-  shutdown helper exists](#why-the-shutdown-helper-exists) below for why
-  this isn't just Proxmox's own default shutdown behavior.
+- On a critical battery event, triggers a plain host shutdown. No custom
+  guest-stopping logic — Proxmox's own `pve-guests.service` already stops
+  every running VM/LXC as part of any normal shutdown, this one included,
+  with no extra script needed. See [How guests get shut
+  down](#how-guests-get-shut-down) below for the one caveat worth knowing.
 - Sets up email alerting (`/etc/nut/notify.sh`) for UPS events — on
   battery, low battery, comms lost, etc — see [Email
   alerting](#email-alerting) below, including a critical warning about how
@@ -107,10 +101,9 @@ Options:
 | `--ha-user-name NAME` | Home Assistant account name (implies `--ha-user`) | `homeassistant` |
 | `--ha-password PASS` | Password for the Home Assistant account (implies `--ha-user`) | randomly generated, printed at the end |
 | `--listen-lan` | Also listen on all interfaces, not just localhost (implied by `--ha-user`) | off |
-| `--no-guest-shutdown` | Skip the timeout helper (Proxmox's own default guest-stop still applies) | off |
 | `--no-notify` | Skip setting up email alerting on UPS events | off |
 | `--notify-email ADDR` | Local mail recipient for alerts (implies alerting is on) | `root` |
-| `--uninstall` | Stop services and remove the installed shutdown helper | — |
+| `--uninstall` | Stop and disable NUT services | — |
 | `-y`, `--yes` | Don't prompt for confirmation | off |
 | `-h`, `--help` | Show help | — |
 
@@ -142,35 +135,26 @@ port 3493, do it with a firewall rule (e.g. the Proxmox/Datacenter
 firewall) scoped to the Home Assistant VM's IP — `upsd` itself no longer
 does per-host access control.
 
-## Why the shutdown helper exists
+## How guests get shut down
 
-Proxmox VE already stops every running VM/LXC on **any** host shutdown, with
-no extra configuration: `pve-guests.service` is enabled by default on every
-install, and its stop action (`pvesh ... stopall`) runs as part of the
-normal systemd shutdown sequence — triggered by the GUI, `shutdown -h now`,
-and therefore by NUT's default `SHUTDOWNCMD` too. If all you wanted was "try
-to shut guests down cleanly before the host goes off," you don't need this
-script's helper at all; `--no-guest-shutdown` gets you a plain
-`shutdown -h +0`, and Proxmox's own mechanism still runs.
+There's no custom guest-stopping logic here. On a critical battery event,
+`upsmon` runs a plain `shutdown -h +0`. Proxmox VE already stops every
+running VM/LXC on **any** host shutdown, with no extra configuration needed:
+`pve-guests.service` is enabled by default on every install, and its stop
+action (`pvesh ... stopall`) runs as part of the normal systemd shutdown
+sequence that `shutdown -h +0` triggers.
 
-What the helper actually adds is a **bounded, explicit timeout**. Left to
-its own defaults, `stopall`'s per-guest timeout and force-stop behavior
-depend on your installed Proxmox version — and there's a documented history
-of that default being effectively unbounded on some versions. That's fine
-for a normal reboot, but not for a UPS with a couple of minutes of runtime
-left: an unresponsive guest could leave the host still waiting to shut down
-when the battery actually dies, which is worse than not having a shutdown
-trigger at all. The helper just calls Proxmox's own `stopall` task with an
-explicit `--timeout`/`--force-stop`, rather than trusting whatever your PVE
-version defaults to.
-
-One thing I haven't been able to verify (Proxmox's own docs and forum were
-unreachable from the environment this was built in): whether `stopall`
-stops guests in parallel or one at a time when you haven't configured an
-explicit "Start/Shutdown order" on them (the common case). If it's
-sequential, the worst-case total time scales with your guest count — with
-close to a dozen VMs/LXCs, that's worth testing for yourself (see below)
-rather than assuming.
+The one caveat worth knowing: `stopall`'s per-guest timeout and force-stop
+behavior depend on your installed Proxmox version, and there's a documented
+history of that default being effectively unbounded on some versions. Fine
+for a normal reboot; on a UPS with a couple of minutes of runtime left, an
+unresponsive guest could in theory leave the host still waiting to shut
+down when the battery actually dies. An earlier version of this project
+called Proxmox's `stopall` task directly with an explicit `--timeout`/
+`--force-stop` to pin that down — it was reverted as more complexity than
+it was worth for a single-node homelab setup, but it's a known option if
+this ever becomes a real problem for you (e.g. if you have guests that are
+often slow to shut down cleanly).
 
 ## Email alerting
 
@@ -238,17 +222,11 @@ again.
 
 Pull the UPS's power cord and let the battery drain to a critical level (or
 temporarily lower `upsmon.conf`'s thresholds via `upssched`/`ups.conf` for a
-faster test in a maintenance window). You can also preview what the helper
-would do without actually stopping anything or powering off:
+faster test), in a maintenance window with everything backed up first. This
+is the only way to see the real thing end to end: `upsmon` firing
+`SHUTDOWNCMD`, the host shutting down, and Proxmox's own `pve-guests.service`
+stopping your actual guests along the way.
 
-```sh
-/usr/local/bin/pve-guest-shutdown.sh --dry-run
-```
-
-This lists your currently-running guests and logs the exact `pvesh`/`shutdown`
-commands it would run, without executing them. It won't tell you how long a
-*real* run would take with all your guests stopping at once, though — for
-that, with everything backed up and in a maintenance window, it's worth
-timing a real (non-dry-run) invocation once, so `GUEST_TIMEOUT` in the
-script (default 60s) is a number you've actually validated against your own
-guest count, not just trusted.
+See the "Never test with `upsmon -c fsd`" warning under [Email
+alerting](#email-alerting) above — the same danger applies here too, since
+it's the same `SHUTDOWNCMD`/`primary` mechanism.

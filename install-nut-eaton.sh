@@ -7,7 +7,8 @@
 # helper that, on a critical battery event, tells Proxmox to stop all
 # running VMs/LXCs with a timeout suited to a dying UPS (rather than
 # whatever your PVE version's own default happens to be) before the host
-# powers off.
+# powers off, and sets up email alerting on UPS events (on battery, low
+# battery, comms lost, etc).
 #
 # Run with --help (or see usage() below) for the full option list.
 
@@ -22,13 +23,15 @@ HA_PASSWORD=""
 GENERATE_PASSWORD=0
 LISTEN_LAN=0
 INSTALL_GUEST_SHUTDOWN=1
+INSTALL_NOTIFY=1
+NOTIFY_EMAIL="root"
 ASSUME_YES=0
 UNINSTALL=0
 
 # When run from a cloned checkout, BASH_SOURCE[0] points at this file and we
 # copy the helper from next to it. When run via `curl | bash` there is no
 # local checkout (BASH_SOURCE[0] is unset and $0 is just "bash"), so the
-# helper is downloaded from this same repo instead - see step 4 below.
+# helper is downloaded from this same repo instead - see step 5 below.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 SHUTDOWN_HELPER_SRC="${SCRIPT_DIR}/scripts/pve-guest-shutdown.sh"
 SHUTDOWN_HELPER_DST="/usr/local/bin/pve-guest-shutdown.sh"
@@ -53,7 +56,7 @@ helper that, on a critical battery event, tells Proxmox to stop all running
 VMs/LXCs with a timeout suited to a dying UPS (Proxmox already stops guests
 on any host shutdown on its own via pve-guests.service - this just pins
 down the timeout instead of trusting your PVE version's own default)
-before the host powers off.
+before the host powers off, and sets up email alerting on UPS events.
 
 Usage:
   ./install-nut-eaton.sh [options]
@@ -72,12 +75,16 @@ Options:
                          implied by --ha-user, since a VM isn't on loopback)
   --no-guest-shutdown   Skip the timeout helper; fall back to a plain shutdown
                         (Proxmox's own guest-stop default still applies)
+  --no-notify           Skip setting up email alerting on UPS events
+  --notify-email ADDR    Local mail recipient for alerts (default: root)
   --uninstall           Remove the NUT config this script created and stop services
   -y, --yes             Do not prompt for confirmation
   -h, --help            Show this help text
 
 Re-running this script is safe: existing config files are backed up with a
-.bak-<timestamp> suffix before being rewritten.
+.bak-<timestamp> suffix before being rewritten, and a full snapshot of
+/etc/nut is additionally saved to /root/nut-config-backup-<timestamp>.tar.gz
+before anything is touched.
 
 Note on "read-only": NUT's protocol does not gate status reads (GET VAR /
 LIST VAR - what upsc and the Home Assistant integration use) behind
@@ -87,6 +94,11 @@ authenticate as a monitor primary or run control commands (SET/INSTCMD), so
 it can't shut anything down or change UPS settings - but the real fence
 around *who can read* is the LISTEN bind address plus your firewall, not
 this password. See the README for a firewall recommendation.
+
+Note on testing alerting: never run `upsmon -c fsd` to test this. On a
+primary instance (which this is) it sets the real forced-shutdown flag and,
+combined with SHUTDOWNCMD, actually shuts the host down. Use
+`NOTIFYTYPE=ONBATT /etc/nut/notify.sh "test"` instead - see the README.
 EOF
 }
 
@@ -101,6 +113,8 @@ while [[ $# -gt 0 ]]; do
     --generate-password) GENERATE_PASSWORD=1; shift ;;
     --listen-lan) LISTEN_LAN=1; shift ;;
     --no-guest-shutdown) INSTALL_GUEST_SHUTDOWN=0; shift ;;
+    --no-notify) INSTALL_NOTIFY=0; shift ;;
+    --notify-email) INSTALL_NOTIFY=1; NOTIFY_EMAIL="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -195,6 +209,10 @@ if [[ $UNINSTALL -eq 1 ]]; then
   exit 0
 fi
 
+if dpkg -l 2>/dev/null | grep -qE '^ii\s+nut\s'; then
+  log "nut is already installed - this run will reconfigure it in place."
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Detect the UPS on USB (informational; usbhid-ups auto-detects at runtime)
 # ---------------------------------------------------------------------------
@@ -224,7 +242,30 @@ apt-get install -y nut usbutils >/dev/null
 id nut >/dev/null 2>&1 || die "nut package installed but 'nut' system user is missing - aborting."
 
 # ---------------------------------------------------------------------------
-# 3. Install the guest graceful-shutdown helper (or fetch it, if we're
+# 3. Reload/retrigger udev rules. The nut package ships a udev rule that
+#    grants the 'nut' group access to known UPS USB IDs, but that only
+#    applies to devices enumerated after the rule exists on disk - if the
+#    UPS was already plugged in before this install, its device node can
+#    still be root-only, which fails the driver with a permissions error
+#    later. Cheap and harmless to always do.
+# ---------------------------------------------------------------------------
+log "Reloading udev rules and retriggering (covers a UPS that was already plugged in before this install)..."
+udevadm control --reload-rules 2>/dev/null || warn "udevadm control --reload-rules failed - continuing."
+udevadm trigger 2>/dev/null || warn "udevadm trigger failed - continuing."
+
+# ---------------------------------------------------------------------------
+# 4. Snapshot the whole of /etc/nut before this run's edits, in addition to
+#    the per-file .bak-<timestamp> backups each step below takes.
+# ---------------------------------------------------------------------------
+if [[ -d "$NUT_ETC" ]]; then
+  full_backup="/root/nut-config-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  log "Backing up ${NUT_ETC} to ${full_backup}..."
+  tar czf "$full_backup" -C "$(dirname "$NUT_ETC")" "$(basename "$NUT_ETC")" 2>/dev/null \
+    || warn "Full ${NUT_ETC} backup failed - continuing (the per-file .bak-<timestamp> backups below still apply)."
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Install the guest graceful-shutdown helper (or fetch it, if we're
 #    running via `curl | bash` with no local checkout to copy it from).
 #    Done before upsmon.conf is written, since that file's SHUTDOWNCMD
 #    depends on whether this succeeded.
@@ -251,7 +292,24 @@ if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Determine passwords: explicit flag > interactive prompt > random
+# 6. notify.sh - mails NOTIFY_EMAIL on UPS state-change events (on battery,
+#    low battery, forced shutdown, comms lost, etc). See upsmon.conf's
+#    NOTIFYFLAG block (step 12) for which events trigger it. This assumes
+#    root's local mail already relays somewhere reachable - verify that
+#    independently (see README); this script has no way to confirm it.
+# ---------------------------------------------------------------------------
+if [[ $INSTALL_NOTIFY -eq 1 ]]; then
+  log "Writing ${NUT_ETC}/notify.sh (mails ${NOTIFY_EMAIL} on UPS events)..."
+  backup_file "${NUT_ETC}/notify.sh"
+  cat > "${NUT_ETC}/notify.sh" <<EOF
+#!/bin/sh
+# Managed by install-nut-eaton.sh
+echo "\$1" | mail -s "NUT: \$NOTIFYTYPE on \$(hostname)" ${NOTIFY_EMAIL}
+EOF
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Determine passwords: explicit flag > interactive prompt > random
 #    generation (only when --generate-password was requested, or there's no
 #    terminal to prompt on). If a read-only Home Assistant account was
 #    requested, it needs the server reachable off-loopback (HA runs in its
@@ -271,7 +329,7 @@ if [[ $HA_USER_ENABLED -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. nut.conf - standalone mode (this node runs driver + server + monitor)
+# 8. nut.conf - standalone mode (this node runs driver + server + monitor)
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/nut.conf..."
 backup_file "${NUT_ETC}/nut.conf"
@@ -280,7 +338,7 @@ MODE=standalone
 EOF
 
 # ---------------------------------------------------------------------------
-# 6. ups.conf - the Eaton 3S is USB HID compliant; usbhid-ups auto-detects it
+# 9. ups.conf - the Eaton 3S is USB HID compliant; usbhid-ups auto-detects it
 #    with port=auto, so no vendor/product ID needs to be hardcoded.
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/ups.conf (UPS name: ${UPS_NAME})..."
@@ -296,7 +354,7 @@ maxretry = 3
 EOF
 
 # ---------------------------------------------------------------------------
-# 7. upsd.conf - who can connect to the data server
+# 10. upsd.conf - who can connect to the data server
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/upsd.conf..."
 backup_file "${NUT_ETC}/upsd.conf"
@@ -316,7 +374,7 @@ if [[ $LISTEN_LAN -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. upsd.users - credentials for clients connecting to upsd
+# 11. upsd.users - credentials for clients connecting to upsd
 # ---------------------------------------------------------------------------
 HA_USER_LOG_SUFFIX=""
 [[ $HA_USER_ENABLED -eq 1 ]] && HA_USER_LOG_SUFFIX=", ${HA_USER_NAME}"
@@ -342,7 +400,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 9. upsmon.conf - local monitoring + shutdown trigger
+# 12. upsmon.conf - local monitoring, shutdown trigger, and alerting
 # ---------------------------------------------------------------------------
 log "Writing ${NUT_ETC}/upsmon.conf..."
 backup_file "${NUT_ETC}/upsmon.conf"
@@ -350,13 +408,27 @@ SHUTDOWN_CMD="/sbin/shutdown -h +0 \"UPS battery critical\""
 if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
   SHUTDOWN_CMD="${SHUTDOWN_HELPER_DST}"
 fi
+NOTIFY_LINES="NOTIFYCMD /usr/sbin/upssched"
+if [[ $INSTALL_NOTIFY -eq 1 ]]; then
+  NOTIFY_LINES="NOTIFYCMD ${NUT_ETC}/notify.sh
+NOTIFYFLAG ONLINE    SYSLOG+EXEC
+NOTIFYFLAG ONBATT    SYSLOG+EXEC
+NOTIFYFLAG LOWBATT   SYSLOG+EXEC
+NOTIFYFLAG FSD       SYSLOG+EXEC
+NOTIFYFLAG COMMOK    SYSLOG+EXEC
+NOTIFYFLAG COMMBAD   SYSLOG+EXEC
+NOTIFYFLAG SHUTDOWN  SYSLOG+EXEC
+NOTIFYFLAG REPLBATT  SYSLOG+EXEC
+NOTIFYFLAG NOCOMM    SYSLOG+EXEC
+NOTIFYFLAG NOPARENT  SYSLOG+EXEC"
+fi
 cat > "${NUT_ETC}/upsmon.conf" <<EOF
 # Managed by install-nut-eaton.sh
 MONITOR ${UPS_NAME}@localhost 1 ${ADMIN_USER} ${ADMIN_PASSWORD} primary
 
 MINSUPPLIES 1
 SHUTDOWNCMD "${SHUTDOWN_CMD}"
-NOTIFYCMD /usr/sbin/upssched
+${NOTIFY_LINES}
 POLLFREQ 15
 POLLFREQALERT 5
 HOSTSYNC 15
@@ -367,16 +439,20 @@ FINALDELAY 5
 EOF
 
 # ---------------------------------------------------------------------------
-# 10. Fix ownership/permissions (NUT is picky about this)
+# 13. Fix ownership/permissions (NUT is picky about this)
 # ---------------------------------------------------------------------------
 log "Setting ownership and permissions on ${NUT_ETC}..."
 chown root:nut "${NUT_ETC}"/nut.conf "${NUT_ETC}"/ups.conf "${NUT_ETC}"/upsd.conf \
   "${NUT_ETC}"/upsd.users "${NUT_ETC}"/upsmon.conf
 chmod 640 "${NUT_ETC}"/ups.conf "${NUT_ETC}"/upsd.conf "${NUT_ETC}"/upsd.users "${NUT_ETC}"/upsmon.conf
 chmod 644 "${NUT_ETC}"/nut.conf
+if [[ $INSTALL_NOTIFY -eq 1 ]]; then
+  chown root:root "${NUT_ETC}/notify.sh"
+  chmod 755 "${NUT_ETC}/notify.sh"
+fi
 
 # ---------------------------------------------------------------------------
-# 11. Enable and start services
+# 14. Enable and start services
 # ---------------------------------------------------------------------------
 log "Enabling and starting NUT services..."
 systemctl daemon-reload
@@ -396,8 +472,19 @@ sleep 2
 systemctl restart nut-server.service
 systemctl restart nut-monitor.service
 
+# The driver runs as its own systemd unit (nut-driver@<name>.service),
+# separate from nut-server/nut-monitor - restarting those two does not
+# start or restart it. Make sure it's actually up before moving on.
+if systemctl list-unit-files "nut-driver@${UPS_NAME}.service" >/dev/null 2>&1; then
+  if ! systemctl is-active --quiet "nut-driver@${UPS_NAME}.service"; then
+    log "Starting nut-driver@${UPS_NAME}.service..."
+    systemctl restart "nut-driver@${UPS_NAME}.service" || \
+      warn "nut-driver@${UPS_NAME}.service failed to start - check: journalctl -u nut-driver@${UPS_NAME} -n 30 (a USB permissions error there usually means the udev retrigger in step 3 didn't take on an already-plugged-in device; try re-plugging the UPS or rebooting)."
+  fi
+fi
+
 # ---------------------------------------------------------------------------
-# 12. Verify
+# 15. Verify
 # ---------------------------------------------------------------------------
 log "Checking driver/server status..."
 sleep 2
@@ -409,8 +496,9 @@ if command -v upsc >/dev/null 2>&1 && upsc "${UPS_NAME}@localhost" >"$upsc_check
   sed -n '1,8p' "$upsc_check_file" | sed 's/^/[nut-setup]   /'
 else
   warn "Could not query '${UPS_NAME}@localhost' yet. This is expected if the UPS isn't plugged in."
-  warn "Once it is connected, check with: upsc ${UPS_NAME}@localhost"
-  warn "and driver logs with: journalctl -u nut-server -u 'nut-driver@${UPS_NAME}' -n 50"
+  warn "Once it is connected: systemctl status nut-driver@${UPS_NAME} ; upsc ${UPS_NAME}@localhost"
+  warn "A USB permissions error in 'journalctl -u nut-driver@${UPS_NAME} -n 50' usually means"
+  warn "the udev rule hasn't applied to this device yet - try re-plugging the UPS, or reboot."
 fi
 rm -f "$upsc_check_file"
 
@@ -432,8 +520,20 @@ if [[ $INSTALL_GUEST_SHUTDOWN -eq 1 ]]; then
   echo "  On critical battery: guests are stopped via Proxmox's own stopall (bounded"
   echo "                       timeout), then the host powers off (see ${SHUTDOWN_HELPER_DST})."
 fi
+if [[ $INSTALL_NOTIFY -eq 1 ]]; then
+  echo "  Alerting:         emails ${NOTIFY_EMAIL} on UPS events (see ${NUT_ETC}/notify.sh)"
+fi
 echo
 echo "Test the install with: upsc ${UPS_NAME}@localhost"
+if [[ $INSTALL_NOTIFY -eq 1 ]]; then
+  echo
+  echo "Before trusting alerting: confirm root's local mail actually goes somewhere -"
+  echo "  echo test | mail -s test ${NOTIFY_EMAIL}"
+  echo "Test the alert path itself (safe - does not touch shutdown logic):"
+  echo "  NOTIFYTYPE=ONBATT ${NUT_ETC}/notify.sh 'test message'"
+  echo "Never use 'upsmon -c fsd' to test - on this primary instance it sets the real"
+  echo "forced-shutdown flag and, combined with SHUTDOWNCMD, actually shuts the host down."
+fi
 if [[ $HA_USER_ENABLED -eq 1 ]]; then
   echo
   echo "In Home Assistant, add the NUT integration pointing at this node's IP,"
